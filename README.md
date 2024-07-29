@@ -16,10 +16,11 @@ I somewhat assume that this kind of performance optimization will eventually be 
 
 
 # Usage 
+    >>> import paddle
     >>> from linear_cross_entropy import LinearCrossEntropyLoss
     >>> module = LinearCrossEntropyLoss(4096, 16384)
-    >>> x = torch.randn(4, 512, 4096, device=torch.device("cuda"))
-    >>> y = torch.randn(4, 512, device=torch.device("cuda"), dtype=torch.long)
+    >>> x = paddle.randn([4, 512, 4096])
+    >>> y = paddle.randn([4, 512], dtype=paddle.float32).cast(paddle.int64)
     >>> loss = module(x, y)
 
 

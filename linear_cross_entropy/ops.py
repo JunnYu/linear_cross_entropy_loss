@@ -1,21 +1,83 @@
-import torch
-import torch.nn.functional as F
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
 import triton
 import triton.language as tl
 import math
 
+def custom_fwd(func):  
+    def wrapper(*args, **kwargs):  
+        ctx = args[0]
+        if len(args) == 1:
+            all_args = tuple(kwargs.values())
+        else:
+            all_args = args[1:] + tuple(kwargs.values())
+        
+        if not hasattr(ctx, "needs_input_grad"):
+            ctx.needs_input_grad = [False] * len(all_args)
+        for i, arg in enumerate(all_args):
+            if isinstance(arg, paddle.Tensor):
+                if not arg.stop_gradient:
+                    ctx.needs_input_grad[i] = True
+            else:
+                ctx.needs_input_grad[i] = "not_tensor"
+        return func(*args, **kwargs)
+    return wrapper  
 
-def reference_torch(x, y, A, ignore_index=5, z_regularization=0.0, logit_scale=1.0):
-    V = A.shape[0]
-    logits = F.linear(x, A).view(-1, V).float() * logit_scale
-    loss = F.cross_entropy(logits, y.view(-1), ignore_index=ignore_index)
-    z_reg = logits.logsumexp(dim=-1)[y != ignore_index].pow(2).mean()
+
+def custom_bwd(func):  
+    def wrapper(*args, **kwargs):
+        ctx = args[0]
+        output = func(*args, **kwargs)
+        result = []
+        for each, need_input_grad in zip(output, ctx.needs_input_grad):
+            if isinstance(need_input_grad, str) and need_input_grad == "not_tensor":
+                continue
+            if need_input_grad:
+                result.append(each)
+            else:
+                result.append(None)
+        while result and result[-1] is None:
+            result.pop()
+        return tuple(result)
+    return wrapper 
+
+def cross_entropy(
+    input,
+    label,
+    weight=None,
+    ignore_index=-100,
+    reduction='mean',
+    soft_label=False,
+    axis=-1,
+    use_softmax=True,
+    label_smoothing=0.0,
+    name=None,
+):
+    if ignore_index < 0 and reduction == "mean":
+        loss = F.cross_entropy(input, label, reduction="none")
+        binary_sequence = paddle.where(
+            loss > 0, paddle.ones_like(loss), paddle.zeros_like(loss)
+        )
+        count = paddle.sum(binary_sequence)
+        if count == 0:
+            loss = paddle.sum(loss * binary_sequence)
+        else:
+            loss = paddle.sum(loss * binary_sequence) / count
+        return loss 
+    return F.cross_entropy(input, label, weight, ignore_index, reduction, soft_label, axis, use_softmax, label_smoothing, name)
+
+def reference_paddle(x, y, A, ignore_index=5, z_regularization=0.0, logit_scale=1.0):
+    logits = F.linear(x, A).flatten(0, 1).cast("float32") * logit_scale
+    y = y.flatten()
+    # paddle reduction = "mean" may has bug, so we will do this manually
+    loss = cross_entropy(logits, y, ignore_index=ignore_index, reduction="mean")
+    z_reg = logits.logsumexp(axis=-1)[y != ignore_index].pow(2).mean()
     loss += z_regularization * z_reg
-    log_probs = torch.log_softmax(logits, dim=-1)[y != ignore_index]
-    logit_ent = (-log_probs.exp() * log_probs).sum(dim=-1).mean()
-    return loss, z_reg.detach(), logits.max().detach(), logit_ent.detach(), logits.norm(dim=-1).mean().detach()
-
+    log_probs = F.log_softmax(logits, axis=-1)[y != ignore_index]
+    logit_ent = (-log_probs.exp() * log_probs).sum(axis=-1).mean()
+    return loss, z_reg.detach(), logits.max().detach(), logit_ent.detach(), logits.norm(axis=-1).mean().detach()
 
 def early_config_prune(configs, named_args, **kwargs):
     dtype = named_args["x_ptr"].dtype
@@ -33,7 +95,7 @@ def early_config_prune(configs, named_args, **kwargs):
     configs = pruned_configs
 
     # Some dtypes do not allow atomic_add
-    if dtype not in [torch.float16, torch.float32]:
+    if dtype not in [paddle.float16, paddle.float32]:
         configs = [
             config
             for config in configs
@@ -655,14 +717,14 @@ def linear_xent_bwd_dispatcher(
         )
 
 
-class LinearXentImplementation(torch.autograd.Function):
+class LinearXentImplementation(paddle.autograd.PyLayer):
     logged_best_config_once = False
 
-    @torch._dynamo.disable()
-    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float16)
+    # @paddle.amp.custom_fwd(device_type="gpu", cast_inputs=paddle.float16)
     # float16 is technically more accurate, and also faster due to freedom to use atomic ops and split V
     # but, I don't know how to tell autocast to cast to the correct cast_inputs for both fp16 and bf16
     @staticmethod
+    @custom_fwd
     def forward(
         ctx,
         x_in,
@@ -674,137 +736,138 @@ class LinearXentImplementation(torch.autograd.Function):
         N_chunk_size: int = 4096,  # N_chunk_size x V is the maximal memory peak
         monitoring: bool = True,
     ):
-        with torch.cuda.device(x_in.device.index):  # actually required for devices other than 0
-            x = x_in.view(-1, x_in.shape[-1])
-            y = y.view(-1)
-            N, H = x.shape
-            H_A, V = At.shape
-            assert H_A == H
-            assert y.shape == (N,)
-            N_group = min(N, N_chunk_size)
+        x = x_in.reshape([-1, x_in.shape[-1]])
+        y = y.flatten()
+        N, H = x.shape
+        H_A, V = At.shape
+        assert H_A == H
+        assert y.shape[0] == N
+        N_group = min(N, N_chunk_size)
 
-            assert N % 512 == 0
-            assert V % 4096 == 0
-            assert H % 256 == 0
-            with torch.no_grad():
-                At_grad = torch.zeros_like(At, dtype=torch.float32 if At.dtype == torch.bfloat16 else At.dtype)
-                x_grad = torch.zeros_like(x, dtype=torch.float32 if At.dtype == torch.bfloat16 else At.dtype)
+        assert N % 512 == 0
+        assert V % 4096 == 0
+        assert H % 256 == 0
+        with paddle.no_grad():
+            At_grad = paddle.zeros_like(At, dtype=paddle.float32 if At.dtype == paddle.bfloat16 else At.dtype)
+            x_grad = paddle.zeros_like(x, dtype=paddle.float32 if At.dtype == paddle.bfloat16 else At.dtype)
 
-                lse_sum, z_reg_value, logit_norm = 0.0, 0.0, 0.0
-                lse_local = -10e5 * torch.ones(N_group, V // 128, dtype=torch.float32, device=x.device)
-                losses = torch.zeros(N_group // 64, V // 128, dtype=torch.float32, device=x.device)
+            lse_sum, z_reg_value, logit_norm = 0.0, 0.0, 0.0
+            lse_local = -10e5 * paddle.ones([N_group, V // 128], dtype=paddle.float32)
+            losses = paddle.zeros([N_group // 64, V // 128], dtype=paddle.float32)
 
-                logits = torch.empty((N_group, V), device=x.device, dtype=torch.float32)
-                logit_ent_local = torch.zeros(V // 128, H // 64, dtype=torch.float32, device=x.device)
-                logit_norm_local = torch.zeros(N_group, V // 128, dtype=torch.float32, device=x.device)
-                logit_max_local = torch.ones(N_group, V // 128, dtype=torch.float32, device=x.device)
+            logits = paddle.empty((N_group, V), dtype=paddle.float32)
+            logit_ent_local = paddle.zeros([V // 128, H // 64], dtype=paddle.float32)
+            logit_norm_local = paddle.zeros([N_group, V // 128], dtype=paddle.float32)
+            logit_max_local = paddle.ones([N_group, V // 128], dtype=paddle.float32)
 
-                reduction = (y != ignore_index).sum()
-                # if reduction == 0: # cannot fake-tensor this condition :(
-                #     ctx.mark_non_differentiable(y)
-                #     ctx.save_for_backward(x_grad, At_grad.to(At.dtype))
-                #     return losses.sum()
+            reduction = (y != ignore_index).sum()
+            # if reduction == 0: # cannot fake-tensor this condition :(
+            #     ctx.mark_non_differentiable(y)
+            #     ctx.save_for_backward(x_grad, At_grad.to(At.dtype))
+            #     return losses.sum()
 
-                fwd_grid = lambda meta: (
-                    triton.cdiv(N_group, meta["N_BLOCK_SIZE"]),
-                    triton.cdiv(V, meta["V_BLOCK_SIZE"]),
+            fwd_grid = lambda meta: (
+                triton.cdiv(N_group, meta["N_BLOCK_SIZE"]),
+                triton.cdiv(V, meta["V_BLOCK_SIZE"]),
+            )
+            bwd_grid_dx_dA = lambda meta: (
+                triton.cdiv(N_group, meta["N_BLOCK_SIZE"]) * meta["SPLIT_V"]
+                + triton.cdiv(V, meta["V_BLOCK_SIZE"]) * meta["SPLIT_N"],
+                triton.cdiv(H, meta["H_BLOCK_SIZE"]),
+            )
+
+            for idx_N_group in range(int(math.ceil(N / N_group))):
+                linear_xent_fwd_prep_bwd_kernel_matmul_t[fwd_grid](
+                    x,
+                    y,
+                    At,
+                    logits,
+                    losses,
+                    lse_local,
+                    logit_max_local,
+                    logit_norm_local,
+                    x.strides[0],
+                    x.strides[1],
+                    At.strides[0],
+                    At.strides[1],
+                    logits.strides[0],
+                    logits.strides[1],
+                    lse_local.strides[0],
+                    lse_local.strides[1],
+                    losses.strides[0],
+                    losses.strides[1],
+                    logit_norm_local.strides[0],
+                    logit_norm_local.strides[1],
+                    reduction,
+                    monitoring=monitoring,
+                    logit_scale=logit_scale,
+                    ignore_index=ignore_index,
+                    idx_N_group=idx_N_group,
+                    N_group=N_group,
+                    V=V,
+                    N=N,
+                    H=H,
                 )
-                bwd_grid_dx_dA = lambda meta: (
-                    triton.cdiv(N_group, meta["N_BLOCK_SIZE"]) * meta["SPLIT_V"]
-                    + triton.cdiv(V, meta["V_BLOCK_SIZE"]) * meta["SPLIT_N"],
-                    triton.cdiv(H, meta["H_BLOCK_SIZE"]),
+                logit_norm += logit_norm_local.sum(axis=-1).sqrt().sum()
+
+                lse_global = lse_local.logsumexp(axis=1)
+                z_reg_block = lse_global.pow(2).sum()
+                if z_regularization > 0:
+                    lse_sum += (lse_global.sum() + z_regularization * z_reg_block) / reduction
+                else:
+                    lse_sum += lse_global.sum() / reduction
+                z_reg_value += z_reg_block / reduction
+
+                linear_xent_bwd_dispatcher[bwd_grid_dx_dA](
+                    logits,
+                    y,
+                    x,
+                    At,
+                    x_grad,
+                    At_grad,
+                    lse_global,
+                    logit_ent_local,
+                    x_grad.strides[0],
+                    x_grad.strides[1],
+                    At.strides[0],
+                    At.strides[1],
+                    logits.strides[0],
+                    logits.strides[1],
+                    logit_ent_local.strides[0],
+                    logit_ent_local.strides[1],
+                    reduction,
+                    monitoring=monitoring,
+                    logit_scale=logit_scale,
+                    z_regularization=z_regularization,
+                    fp32_grad_accumulators=True,
+                    ignore_index=ignore_index,
+                    idx_N_group=idx_N_group,
+                    N_group=N_group,
+                    V=V,
+                    N=N,
+                    H=H,
                 )
 
-                for idx_N_group in range(int(math.ceil(N / N_group))):
-                    linear_xent_fwd_prep_bwd_kernel_matmul_t[fwd_grid](
-                        x,
-                        y,
-                        At,
-                        logits,
-                        losses,
-                        lse_local,
-                        logit_max_local,
-                        logit_norm_local,
-                        x.stride(0),
-                        x.stride(1),
-                        At.stride(0),
-                        At.stride(1),
-                        logits.stride(0),
-                        logits.stride(1),
-                        lse_local.stride(0),
-                        lse_local.stride(1),
-                        losses.stride(0),
-                        losses.stride(1),
-                        logit_norm_local.stride(0),
-                        logit_norm_local.stride(1),
-                        reduction,
-                        monitoring=monitoring,
-                        logit_scale=logit_scale,
-                        ignore_index=ignore_index,
-                        idx_N_group=idx_N_group,
-                        N_group=N_group,
-                        V=V,
-                        N=N,
-                        H=H,
-                    )
-                    logit_norm += logit_norm_local.sum(dim=-1).sqrt().sum()
+            logit_max = logit_max_local.max()
+            logit_ent = logit_ent_local.sum()
+            ctx.mark_non_differentiable(z_reg_value, logit_max, logit_ent, logit_norm)
+            ctx.save_for_backward(x_grad.reshape(x_in.shape), At_grad)
+            if not LinearXentImplementation.logged_best_config_once:
+                print("fwd", linear_xent_fwd_prep_bwd_kernel_matmul_t.best_config)
+                print("bwd", linear_xent_bwd_dispatcher.best_config)
+                LinearXentImplementation.logged_best_config_once = True
 
-                    lse_global = lse_local.logsumexp(dim=1)
-                    z_reg_block = lse_global.pow(2).sum()
-                    if z_regularization > 0:
-                        lse_sum += (lse_global.sum() + z_regularization * z_reg_block) / reduction
-                    else:
-                        lse_sum += lse_global.sum() / reduction
-                    z_reg_value += z_reg_block / reduction
-
-                    linear_xent_bwd_dispatcher[bwd_grid_dx_dA](
-                        logits,
-                        y,
-                        x,
-                        At,
-                        x_grad,
-                        At_grad,
-                        lse_global,
-                        logit_ent_local,
-                        x_grad.stride(0),
-                        x_grad.stride(1),
-                        At.stride(0),
-                        At.stride(1),
-                        logits.stride(0),
-                        logits.stride(1),
-                        logit_ent_local.stride(0),
-                        logit_ent_local.stride(1),
-                        reduction,
-                        monitoring=monitoring,
-                        logit_scale=logit_scale,
-                        z_regularization=z_regularization,
-                        fp32_grad_accumulators=True,
-                        ignore_index=ignore_index,
-                        idx_N_group=idx_N_group,
-                        N_group=N_group,
-                        V=V,
-                        N=N,
-                        H=H,
-                    )
-
-                logit_max = logit_max_local.max()
-                logit_ent = logit_ent_local.sum()
-                ctx.mark_non_differentiable(z_reg_value, logit_max, logit_ent, logit_norm)
-                ctx.save_for_backward(x_grad.view_as(x_in), At_grad)
-                if not LinearXentImplementation.logged_best_config_once:
-                    print("fwd", linear_xent_fwd_prep_bwd_kernel_matmul_t.best_config)
-                    print("bwd", linear_xent_bwd_dispatcher.best_config)
-                    LinearXentImplementation.logged_best_config_once = True
-
-            return lse_sum + losses.sum(), z_reg_value, logit_max, logit_ent, logit_norm
+        return lse_sum + losses.sum(), z_reg_value, logit_max, logit_ent, logit_norm
 
     @staticmethod
-    @torch.amp.custom_bwd(device_type="cuda")
-    @torch.inference_mode()
+    # @torch.amp.custom_bwd(device_type="cuda")
+    # @torch.inference_mode()
+    @custom_bwd
+    @paddle.no_grad()
     def backward(ctx, grad_output, void0, void1, void2, void3):
-        x_grad, At_grad = ctx.saved_tensors
+        x_grad, At_grad = ctx.saved_tensor()
 
-        return x_grad.mul_(grad_output), None, At_grad.mul_(grad_output), None, None, None, None, None
+        return x_grad.scale_(grad_output), None, At_grad.scale_(grad_output), None, None, None, None, None
 
 
 # functional version:
@@ -817,21 +880,21 @@ def linear_cross_entropy(
     logit_scale: float = 1.0,
     N_chunk_size: int = 4096,
     monitoring: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor]:
     return LinearXentImplementation.apply(
         x, y, At, ignore_index, z_regularization, logit_scale, N_chunk_size, monitoring
     )  # type: ignore
 
 
 # Full Layer:
-class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be identified as such
+class LinearCrossEntropyLoss(nn.Linear):  # an instance of nn.Linear to be identified as such
     r"""Applies a linear transformation to the incoming data: :math:`z = xA^T` and then immediately
         computes the cross entropy loss of z with a tensor of labels y, and returns the loss as a scalar value.
 
     Caveats:
     * All dimensions need to be divisible by sufficiently large powers of 2
     * Monitoring is optional and turned off by default.
-    * Speed-ups over a compiled torch baseline only materialize in float 16 with sufficiently large vocabulary sizes / numbers of classes
+    * Speed-ups over a compiled paddle baseline only materialize in float 16 with sufficiently large vocabulary sizes / numbers of classes
       or very long sequences or batch sizes.
     * This module is an instance of `nn.Linear` to pick up initialization calls to `nn.Linear`, but the weight matrix is transposed
       compared to normal `nn.Linear` layers.
@@ -860,7 +923,7 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
     Shape:
         - Input x (input embeddings): :math:`(*, H_{in})` where :math:`*` means any number of
           dimensions including none and :math:`H_{in} = \text{in\_features}`.
-        - Input y (labels): :math:`(*)` This should be a `torch.long` tensor with the same number of elements,`(*)`,
+        - Input y (labels): :math:`(*)` This should be a `paddle.long` tensor with the same number of elements,`(*)`,
           as the input embeeddings.
         - Output: :math:`(1,)` This function always returns the fully reduced loss.
 
@@ -876,26 +939,27 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
 
     Examples::
 
+        >>> import paddle
         >>> from linear_cross_entropy import LinearCrossEntropyLoss
         >>> module = LinearCrossEntropyLoss(4096, 16384)
-        >>> loss = module(torch.randn(4, 512, 4096, device=torch.device("cuda")))
-
+        >>> x = paddle.randn([4, 512, 4096])
+        >>> y = paddle.randn([4, 512], dtype=paddle.float32).cast(paddle.int64)
+        >>> loss = module(x, y)
     """
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        device=None,
-        dtype=None,
         ignore_index: int = -100,
         logit_scale: float = 1.0,
         z_regularization: float = 0.0,
         N_chunk_size: int = 4096,
         init_method=None,
+        device=None,
+        dtype=None,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        torch.nn.Module.__init__(self)
+        nn.Layer.__init__(self)
 
         assert in_features % 256 == 0
         assert out_features % 4096 == 0
@@ -905,7 +969,10 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
 
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = torch.nn.Parameter(torch.empty((in_features, out_features), **factory_kwargs))  # transposed!
+        self.weight = self.create_parameter(
+            shape=[in_features, out_features],
+            dtype=paddle.get_default_dtype(),
+        )
 
         self.logit_scale = logit_scale
         self.ignore_index = ignore_index
@@ -923,7 +990,8 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
             self.init_method(self.weight)
         else:
             std = math.sqrt(1 / self.in_features)
-            torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+            trunc_normal_ = nn.initializer.TruncatedNormal(mean=0.0, std=std, a=-3 * std, b=3 * std)
+            trunc_normal_(self.weight)
 
     def forward(self, x, y):
         loss, z_reg, logit_max, logit_ent, logit_norm = LinearXentImplementation.apply(
